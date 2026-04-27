@@ -1,0 +1,21 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "C4",    # flake8-comprehensions
+    "PIE",   # flake8-pie
+    "RET",   # flake8-return
+    "PTH",   # flake8-use-pathlib
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "E501",  # line too long: long URLs / prompt strings are fine
+]

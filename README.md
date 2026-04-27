@@ -211,6 +211,19 @@ For a 32-minute recording on Apple Silicon (mlx-whisper + VideoToolbox): expect 
 
 ---
 
+## Development
+
+Lint with [Ruff](https://docs.astral.sh/ruff/) (no install needed — `uvx` runs it on demand):
+
+```bash
+uvx ruff check tightcut.py        # lint
+uvx ruff check --fix tightcut.py  # lint + auto-fix what's safe
+```
+
+Configuration lives in [`ruff.toml`](./ruff.toml).
+
+---
+
 ## Roadmap ideas
 
 - [ ] Custom filler list via CLI flag instead of editing the file

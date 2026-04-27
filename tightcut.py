@@ -30,11 +30,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from tqdm import tqdm
-
 
 HESITATION_FILLERS = {
     "ehm", "ehmm", "ehmmm", "uhm", "uhmm", "mh", "mhm", "mmm", "mmmm", "mmh",
@@ -178,7 +177,7 @@ def _transcribe_faster_whisper(wav: Path, language: str, model_size: str) -> lis
         language=language,
         word_timestamps=True,
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=250),
+        vad_parameters={"min_silence_duration_ms": 250},
         beam_size=5,
         initial_prompt=VERBATIM_PROMPT_IT if language == "it" else None,
         condition_on_previous_text=False,
@@ -198,7 +197,8 @@ def _transcribe_faster_whisper(wav: Path, language: str, model_size: str) -> lis
 
 
 def normalize_token(s: str) -> str:
-    return s.strip(" .,?!\"'…-—–:;()").lower()
+    # strips hyphen, em dash and en dash on purpose
+    return s.strip(" .,?!\"'…-—–:;()").lower()  # noqa: RUF001
 
 
 def build_cuts(
