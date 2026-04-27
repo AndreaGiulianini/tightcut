@@ -3,22 +3,29 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "faster-whisper>=1.1.0",
+#     "mlx-whisper>=0.4.2; platform_system == 'Darwin' and platform_machine == 'arm64'",
 #     "tqdm>=4.66",
 # ]
 # ///
-"""tightcut: remove silences and filler words from a video using faster-whisper + ffmpeg.
+"""tightcut: remove silences and filler words from a video using whisper + ffmpeg.
+
+Picks the fastest available backend automatically:
+  - mlx-whisper on Apple Silicon (uses GPU + Neural Engine via MLX)
+  - faster-whisper everywhere else (Linux / Windows / Intel Mac, CPU + CUDA)
 
 Examples:
     ./tightcut.py input.mov
     ./tightcut.py input.mov -o out.mov --max-silence 0.4 --aggressive
     ./tightcut.py input.mov --dry-run            # see what would be cut
     ./tightcut.py input.mov --model large-v3     # max accuracy (slower)
+    ./tightcut.py input.mov --backend faster-whisper   # force CPU backend
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import platform
 import shutil
 import subprocess
 import sys
@@ -26,7 +33,6 @@ import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from faster_whisper import WhisperModel
 from tqdm import tqdm
 
 
@@ -39,6 +45,21 @@ DISCOURSE_FILLERS = {
     "cioè", "tipo", "diciamo", "praticamente", "insomma", "boh",
     "ecco", "appunto", "comunque", "allora",
 }
+
+# user-facing model size -> mlx-community HF repo
+MLX_MODEL_MAP = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+VERBATIM_PROMPT_IT = (
+    "Trascrizione fedele parola per parola, "
+    "includendo esitazioni come ehm, uhm, eh, ah, mh."
+)
 
 
 @dataclass
@@ -68,11 +89,72 @@ def extract_audio(video: Path, wav: Path) -> None:
     ])
 
 
-def transcribe(wav: Path, language: str, model_size: str) -> list[Word]:
-    print(f"[*] Loading faster-whisper model '{model_size}' (first run downloads it)...")
-    # int8 on CPU is the fastest reliable path on Apple Silicon.
+def detect_backend() -> str:
+    """Pick the fastest backend available on this machine."""
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            import mlx_whisper  # noqa: F401
+            return "mlx"
+        except ImportError:
+            pass
+    return "faster-whisper"
+
+
+def detect_encoder() -> str:
+    """Pick the best portable hardware encoder for this machine."""
+    if platform.system() == "Darwin":
+        return "h264_videotoolbox"
+    return "libx264"
+
+
+def transcribe(wav: Path, language: str, model_size: str, backend: str) -> list[Word]:
+    if backend == "auto":
+        backend = detect_backend()
+    print(f"[*] Backend: {backend}  |  Model: {model_size}  |  Language: {language}")
+    if backend == "mlx":
+        return _transcribe_mlx(wav, language, model_size)
+    return _transcribe_faster_whisper(wav, language, model_size)
+
+
+def _transcribe_mlx(wav: Path, language: str, model_size: str) -> list[Word]:
+    try:
+        import mlx_whisper
+    except ImportError as exc:
+        raise SystemExit(
+            "mlx-whisper not installed. It only runs on Apple Silicon. "
+            "Use --backend faster-whisper to fall back, or run on a Mac."
+        ) from exc
+    repo = MLX_MODEL_MAP.get(model_size, model_size)
+    print(f"[*] Loading mlx-whisper '{repo}' (first run downloads it from HF)...")
+    print("[*] Transcribing on Apple GPU/Neural Engine...")
+    result = mlx_whisper.transcribe(
+        str(wav),
+        path_or_hf_repo=repo,
+        language=language,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        initial_prompt=VERBATIM_PROMPT_IT if language == "it" else None,
+        verbose=False,
+    )
+    words: list[Word] = []
+    for seg in result.get("segments", []):
+        for w in seg.get("words", []) or []:
+            text = w.get("word") or w.get("text") or ""
+            if not text.strip():
+                continue
+            words.append(Word(text.strip(), float(w["start"]), float(w["end"])))
+    return words
+
+
+def _transcribe_faster_whisper(wav: Path, language: str, model_size: str) -> list[Word]:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise SystemExit("faster-whisper not installed. Reinstall the script's dependencies.") from exc
+    print(f"[*] Loading faster-whisper '{model_size}' (first run downloads it)...")
+    # int8 CPU is the most portable path; on CUDA you can edit this to ("cuda", "float16").
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    print("[*] Transcribing... this is the slow step.")
+    print("[*] Transcribing on CPU...")
     segments, info = model.transcribe(
         str(wav),
         language=language,
@@ -80,11 +162,7 @@ def transcribe(wav: Path, language: str, model_size: str) -> list[Word]:
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=250),
         beam_size=5,
-        # nudge the model toward verbatim transcription (incl. hesitations)
-        initial_prompt=(
-            "Trascrizione fedele parola per parola, "
-            "includendo esitazioni come ehm, uhm, eh, ah, mh."
-        ),
+        initial_prompt=VERBATIM_PROMPT_IT if language == "it" else None,
         condition_on_previous_text=False,
     )
     words: list[Word] = []
@@ -185,7 +263,9 @@ def assemble(
     ]
     if encoder == "h264_videotoolbox":
         cmd += ["-b:v", "12M", "-pix_fmt", "yuv420p"]
-    else:
+    elif encoder == "h264_nvenc":
+        cmd += ["-cq", "22", "-preset", "p5", "-pix_fmt", "yuv420p"]
+    else:  # libx264
         cmd += ["-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
     cmd += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
     try:
@@ -211,7 +291,10 @@ def main() -> None:
     p.add_argument("-o", "--output", type=Path, default=None)
     p.add_argument("--language", default="it")
     p.add_argument("--model", default="large-v3-turbo",
-                   help="faster-whisper model: tiny|base|small|medium|large-v3|large-v3-turbo")
+                   help="whisper model: tiny|base|small|medium|large-v3|large-v3-turbo")
+    p.add_argument("--backend", default="auto",
+                   choices=["auto", "mlx", "faster-whisper"],
+                   help="speech recognition backend [auto picks mlx on Apple Silicon, faster-whisper elsewhere]")
     p.add_argument("--max-silence", type=float, default=0.5,
                    help="silences longer than this (s) are cut [default: 0.5]")
     p.add_argument("--pad", type=float, default=0.08,
@@ -220,8 +303,9 @@ def main() -> None:
                    help="also cut discourse markers: cioè, tipo, diciamo, ...")
     p.add_argument("--no-fillers", action="store_true",
                    help="only cut silences, keep filler words")
-    p.add_argument("--encoder", default="h264_videotoolbox",
-                   choices=["h264_videotoolbox", "libx264"])
+    p.add_argument("--encoder", default="auto",
+                   choices=["auto", "h264_videotoolbox", "libx264", "h264_nvenc"],
+                   help="auto picks h264_videotoolbox on macOS, libx264 elsewhere")
     p.add_argument("--no-cache", action="store_true",
                    help="ignore cached transcription and re-run whisper")
     p.add_argument("--dry-run", action="store_true",
@@ -254,7 +338,7 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as td:
             wav = Path(td) / "audio.wav"
             extract_audio(video, wav)
-            words = transcribe(wav, args.language, args.model)
+            words = transcribe(wav, args.language, args.model, args.backend)
         cache_path.write_text(json.dumps([asdict(w) for w in words], ensure_ascii=False))
         print(f"[*] Cached transcription -> {cache_path.name}")
 
@@ -274,7 +358,9 @@ def main() -> None:
             print(f"  cut {fmt(s)} -> {fmt(e)}  ({e - s:.2f}s) {r}")
         return
 
-    assemble(video, keeps, output, args.encoder)
+    encoder = detect_encoder() if args.encoder == "auto" else args.encoder
+    print(f"[*] Encoder: {encoder}")
+    assemble(video, keeps, output, encoder)
     print(f"[OK] {output}")
 
 
