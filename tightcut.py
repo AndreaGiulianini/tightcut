@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 HESITATION_FILLERS = {
     "ehm", "ehmm", "ehmmm", "uhm", "uhmm", "mh", "mhm", "mmm", "mmmm", "mmh",
-    "hmm", "eh", "ehh", "ah", "ahh", "uh", "uhh", "eee", "ee", "uhh", "umm",
+    "hmm", "eh", "ehh", "ah", "ahh", "uh", "uhh", "eee", "ee", "umm",
 }
 
 DISCOURSE_FILLERS = {
@@ -61,16 +61,18 @@ VERBATIM_PROMPT_IT = (
     "includendo esitazioni come ehm, uhm, eh, ah, mh."
 )
 
+ENCODER_ARGS = {
+    "h264_videotoolbox": ["-b:v", "12M"],
+    "h264_nvenc": ["-cq", "22", "-preset", "p5"],
+    "libx264": ["-crf", "20", "-preset", "veryfast"],
+}
+
 
 @dataclass
 class Word:
     text: str
     start: float
     end: float
-
-
-def run(cmd: list[str]) -> None:
-    subprocess.run(cmd, check=True)
 
 
 def probe_duration(path: Path) -> float:
@@ -83,10 +85,10 @@ def probe_duration(path: Path) -> float:
 
 def extract_audio(video: Path, wav: Path) -> None:
     print(f"[*] Extracting audio to {wav.name} (16 kHz mono PCM)...")
-    run([
+    subprocess.run([
         "ffmpeg", "-y", "-loglevel", "error", "-stats", "-i", str(video),
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav),
-    ])
+    ], check=True)
 
 
 def detect_backend() -> str:
@@ -114,6 +116,22 @@ def transcribe(wav: Path, language: str, model_size: str, backend: str) -> list[
     if backend == "mlx":
         return _transcribe_mlx(wav, language, model_size)
     return _transcribe_faster_whisper(wav, language, model_size)
+
+
+def load_or_transcribe(
+    video: Path, language: str, model: str, backend: str, no_cache: bool
+) -> list[Word]:
+    cache_path = video.with_name(video.name + ".whisper.json")
+    if cache_path.exists() and not no_cache:
+        print(f"[*] Reusing cached transcription: {cache_path.name} (use --no-cache to redo)")
+        return [Word(**w) for w in json.loads(cache_path.read_text())]
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "audio.wav"
+        extract_audio(video, wav)
+        words = transcribe(wav, language, model, backend)
+    cache_path.write_text(json.dumps([asdict(w) for w in words], ensure_ascii=False))
+    print(f"[*] Cached transcription -> {cache_path.name}")
+    return words
 
 
 def _transcribe_mlx(wav: Path, language: str, model_size: str) -> list[Word]:
@@ -259,17 +277,11 @@ def assemble(
         "-i", str(video),
         "-filter_complex_script", str(script_path),
         "-map", "[outv]", "-map", "[outa]",
-        "-c:v", encoder,
+        "-c:v", encoder, *ENCODER_ARGS[encoder], "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
     ]
-    if encoder == "h264_videotoolbox":
-        cmd += ["-b:v", "12M", "-pix_fmt", "yuv420p"]
-    elif encoder == "h264_nvenc":
-        cmd += ["-cq", "22", "-preset", "p5", "-pix_fmt", "yuv420p"]
-    else:  # libx264
-        cmd += ["-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
     try:
-        run(cmd)
+        subprocess.run(cmd, check=True)
     finally:
         script_path.unlink(missing_ok=True)
 
@@ -320,8 +332,6 @@ def main() -> None:
             sys.exit(f"{tool} not on PATH -- run: brew install ffmpeg")
 
     output = args.output or video.with_name(video.stem + ".cut.mov")
-    cache_path = video.with_suffix(video.suffix + ".whisper.json")
-
     duration = probe_duration(video)
     print(f"[*] Input: {video.name} ({fmt(duration)})")
 
@@ -331,22 +341,13 @@ def main() -> None:
         if args.aggressive:
             fillers |= DISCOURSE_FILLERS
 
-    if cache_path.exists() and not args.no_cache:
-        print(f"[*] Reusing cached transcription: {cache_path.name} (use --no-cache to redo)")
-        words = [Word(**w) for w in json.loads(cache_path.read_text())]
-    else:
-        with tempfile.TemporaryDirectory() as td:
-            wav = Path(td) / "audio.wav"
-            extract_audio(video, wav)
-            words = transcribe(wav, args.language, args.model, args.backend)
-        cache_path.write_text(json.dumps([asdict(w) for w in words], ensure_ascii=False))
-        print(f"[*] Cached transcription -> {cache_path.name}")
+    words = load_or_transcribe(video, args.language, args.model, args.backend, args.no_cache)
 
     cuts = build_cuts(words, duration, fillers, args.max_silence, args.pad)
     keeps = invert(cuts, duration)
     cut_total = sum(e - s for s, e, _ in cuts)
     keep_total = sum(e - s for s, e in keeps)
-    n_silence = sum(1 for *_, r in cuts if r == "silence" or r == "mixed")
+    n_silence = sum(1 for c in cuts if c[2] in ("silence", "mixed"))
     n_filler = len(cuts) - n_silence
     print(f"[*] Removing {len(cuts)} segments "
           f"(~{n_silence} silences, ~{n_filler} fillers): {fmt(cut_total)} cut")
