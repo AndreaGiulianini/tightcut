@@ -133,6 +133,17 @@ def probe_duration(path: Path) -> float:
     return float(out.strip())
 
 
+def probe_fps(path: Path) -> float:
+    """Average frame rate of the first video stream, as a float."""
+    out = check_ff_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+    ], f"ffprobe (fps of {path.name})")
+    num, _, den = out.strip().partition("/")
+    return float(num) / float(den) if den else float(num)
+
+
 def probe_keyframes(path: Path) -> list[float]:
     """Sorted list of video keyframe pts_time values."""
     out = check_ff_output([
@@ -391,9 +402,10 @@ def assemble(
         _assemble_full(video, keeps, output, encoder)
         return
     keyframes = load_or_probe_keyframes(video, no_cache)
+    fps = probe_fps(video)
     gop = (keyframes[-1] - keyframes[0]) / max(1, len(keyframes) - 1) if len(keyframes) >= 2 else 0.0
-    info(f"[*] Found {len(keyframes)} keyframes (~{gop:.2f}s GOP)")
-    _assemble_smart(video, keeps, output, encoder, keyframes)
+    info(f"[*] Found {len(keyframes)} keyframes (~{gop:.2f}s GOP, {fps:.3f} fps)")
+    _assemble_smart(video, keeps, output, encoder, keyframes, fps)
 
 
 def _assemble_full(
@@ -422,7 +434,8 @@ def _assemble_full(
 
 
 def _run_video_segment(
-    video: Path, start: float, end: float, mode: str, encoder: str, out_path: Path,
+    video: Path, start: float, end: float, mode: str, encoder: str,
+    out_path: Path, fps: float,
 ) -> None:
     """Encode or stream-copy a single VIDEO-ONLY sub-segment.
 
@@ -430,21 +443,27 @@ def _run_video_segment(
     per-fragment audio re-encodes is unsafe (AAC priming offsets accumulate at
     each fragment boundary) and `-c:a copy` over `-ss` skews to the demuxer's
     keyframe-aligned position rather than `start`.
+
+    Copy mode uses `-frames:v N` rather than `-t`. ffmpeg's `-t` for stream-copy
+    rounds UP to the nearest packet, overshooting the requested end by 1-2
+    frames; that overshoot doesn't show up in the audio rebuild and produces
+    visible A/V drift at every cut. `-frames:v` is exact (assumes CFR; fine for
+    the talking-head / podcast sources this tool targets).
     """
-    dur = f"{end - start:.3f}"
     if mode == "encode":
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{start:.3f}", "-i", str(video), "-t", dur,
+            "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end - start:.3f}",
             "-an",
             "-c:v", encoder, *ENCODER_ARGS[encoder], "-pix_fmt", "yuv420p",
             "-avoid_negative_ts", "make_zero",
             str(out_path),
         ]
     else:
+        n_frames = max(1, round((end - start) * fps))
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-ss", f"{start:.3f}", "-i", str(video), "-t", dur,
+            "-ss", f"{start:.3f}", "-i", str(video), "-frames:v", str(n_frames),
             "-an",
             "-c:v", "copy",
             "-avoid_negative_ts", "make_zero",
@@ -505,9 +524,19 @@ def _assemble_smart(
     output: Path,
     encoder: str,
     keyframes: list[float],
+    fps: float,
 ) -> None:
-    pieces: list[tuple[float, float, str]] = []
+    # Snap each keep's end down to the nearest whole-frame boundary so the
+    # audio (rebuilt via atrim, sample-precise) ends at exactly the same source
+    # time as the video (built with -frames:v N, frame-precise). Without this,
+    # rounding at each cut produces sub-frame A/V drift.
+    aligned_keeps: list[tuple[float, float]] = []
     for s, e in keeps:
+        n = max(1, round((e - s) * fps))
+        aligned_keeps.append((s, s + n / fps))
+
+    pieces: list[tuple[float, float, str]] = []
+    for s, e in aligned_keeps:
         pieces.extend(split_keep_smart(s, e, keyframes))
     enc_dur = sum(e - s for s, e, m in pieces if m == "encode")
     cp_dur = sum(e - s for s, e, m in pieces if m == "copy")
@@ -522,14 +551,14 @@ def _assemble_smart(
             tqdm(pieces, desc="video", unit="seg", smoothing=0.1, disable=_QUIET)
         ):
             part = out_dir / f"v_{i:05d}.mov"
-            _run_video_segment(video, s, e, mode, encoder, part)
+            _run_video_segment(video, s, e, mode, encoder, part, fps)
             parts.append(part)
         video_concat = out_dir / "video.mov"
         info(f"[*] Concatenating {len(parts)} video fragments")
         _concat_copy(parts, video_concat)
         audio_path = out_dir / "audio.m4a"
-        info(f"[*] Building audio track ({fmt(sum(e - s for s, e in keeps))})")
-        _build_audio_track(video, keeps, audio_path)
+        info(f"[*] Building audio track ({fmt(sum(e - s for s, e in aligned_keeps))})")
+        _build_audio_track(video, aligned_keeps, audio_path)
         info(f"[*] Muxing -> {output.name}")
         _mux_av(video_concat, audio_path, output)
 
