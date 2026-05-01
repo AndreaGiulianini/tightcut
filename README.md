@@ -58,15 +58,22 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 **Windows:** install [ffmpeg](https://ffmpeg.org/download.html) and [uv](https://docs.astral.sh/uv/getting-started/installation/) from their official pages.
 
-For the encoder, defaults are: `h264_videotoolbox` on macOS, `libx264` everywhere else (override with `--encoder`).
+For the encoder, defaults are: `h264_videotoolbox` on macOS, `h264_nvenc` if `nvidia-smi` is on `PATH`, `libx264` everywhere else (override with `--encoder`).
 
 ---
 
 ## Usage
 
+> **Default language is Italian (`--language it`).** Pass `--language en` (or
+> `es`, `fr`, ...) for any other language, or you'll get an Italian transcription
+> of your English audio and very poor cuts.
+
 ```bash
-# Basic: cuts hesitations and silences > 0.5s
+# Basic: cuts hesitations and silences > 0.5s (Italian audio)
 uv run --script tightcut.py input.mov
+
+# English (or any non-Italian) source
+uv run --script tightcut.py talk.mp4 --language en
 
 # Output goes to input.cut.mov by default. Override with -o:
 uv run --script tightcut.py input.mov -o edited.mov
@@ -86,9 +93,11 @@ uv run --script tightcut.py input.mov --no-fillers
 # Slower but more accurate model
 uv run --script tightcut.py input.mov --model large-v3
 
-# Other languages
-uv run --script tightcut.py talk.mp4 --language en
-uv run --script tightcut.py charla.mp4 --language es
+# Encode mode (see below). Smart is the default; full is the safest.
+uv run --script tightcut.py input.mov --encode-mode full
+
+# Quiet: only the final [OK] line on success
+uv run --script tightcut.py input.mov --quiet
 ```
 
 ### All options
@@ -102,11 +111,13 @@ uv run --script tightcut.py charla.mp4 --language es
 | `--max-silence` | `0.5` | Silences longer than this (seconds) are cut. |
 | `--pad` | `0.08` | Padding kept on each side of a cut, to avoid clipping speech. |
 | `--aggressive` | off | Also cut discourse markers (see [Filler word lists](#filler-word-lists)). |
-| `--no-fillers` | off | Cut silences only, keep all words. |
+| `--no-fillers` | off | Cut silences only, keep all words (overrides `--aggressive`). |
 | `--backend` | `auto` | `auto` / `mlx` (Apple Silicon, GPU+ANE) / `faster-whisper` (everywhere, CPU+CUDA). |
-| `--encoder` | `auto` | `auto` / `h264_videotoolbox` (macOS) / `libx264` (portable) / `h264_nvenc` (NVIDIA). |
-| `--no-cache` | off | Ignore the cached transcription and re-run Whisper. |
+| `--encoder` | `auto` | `auto` picks `h264_videotoolbox` on macOS, `h264_nvenc` if `nvidia-smi` is on `PATH`, otherwise `libx264`. |
+| `--encode-mode` | `smart` | `smart` (re-encode only sub-keyframe heads, stream-copy the rest) / `full` (re-encode everything via `filter_complex`). See [Encode modes](#encode-modes). |
+| `--no-cache` | off | Ignore cached transcription and keyframes; redo from scratch. |
 | `--dry-run` | off | Print the planned cuts and exit, no re-encoding. |
+| `-q, --quiet` | off | Suppress info messages and progress bars. Errors and the final `[OK]` line still shown. |
 
 ---
 
@@ -135,8 +146,9 @@ audio.wav  ----> whisper (large-v3-turbo, word_timestamps=True)
                     v
               keeps: [(start, end), ...]
                     |
-                    |  ffmpeg: filter_complex with trim/atrim/concat,
-                    |          re-encode via h264_videotoolbox / libx264 / h264_nvenc
+                    |  ffmpeg: smart-cut (default) -- stream-copy keyframe-aligned
+                    |          spans, re-encode only sub-GOP heads; rebuild audio
+                    |          in one filter_complex pass; mux. See "Encode modes".
                     v
                output.cut.mov
 ```
@@ -147,8 +159,15 @@ audio.wav  ----> whisper (large-v3-turbo, word_timestamps=True)
 - **`large-v3-turbo` as default**: ~6× faster than `large-v3` with marginal quality loss. For a 30-minute Italian recording this saves ~10 minutes per run. Use `--model large-v3` if you need maximum accuracy.
 - **Verbatim prompt + `condition_on_previous_text=False`**: vanilla Whisper is trained to *strip* disfluencies. The initial prompt nudges it toward verbatim transcription so we get a chance to detect "ehm" / "uhm" as actual tokens.
 - **VAD pre-filter** (only available on `faster-whisper`): segments audio at silences before transcription, helping reduce hallucinations on long pauses.
-- **`filter_complex` with `trim` + `atrim` + `concat`**: produces frame-accurate cuts. Stream copy can't cut inside a GOP, so re-encoding is unavoidable. Hardware encoding (VideoToolbox / NVENC) keeps it fast.
-- **Transcription cache**: lets you tune `--max-silence` / `--aggressive` / `--pad` interactively without paying the transcription cost every time.
+- **Smart-cut as default**: stream-copies keyframe-aligned video where it can and only re-encodes the small sub-GOP fragments that don't align. Roughly 3–4× faster than re-encoding everything on a typical podcast/screencast source. Hardware encoding (VideoToolbox / NVENC) keeps the re-encoded portion fast.
+- **Transcription + keyframe cache**: lets you tune `--max-silence` / `--aggressive` / `--pad` interactively without re-transcribing or re-probing keyframes every time. Sidecar files: `<input>.whisper.json` and `<input>.keyframes.json`. Use `--no-cache` to invalidate both.
+
+### Encode modes
+
+`--encode-mode` picks the trade-off between speed and player compatibility:
+
+- **`smart`** *(default)*: probes keyframes once, then for each kept range stream-copies the keyframe-aligned body and re-encodes only the small leading fragment that isn't keyframe-aligned. Audio is rebuilt precisely in one pass. Frame-accurate cuts; ~3–4× faster than `full` on a typical 8-second-GOP source. The first run probes keyframes (~2–3 s) and caches them to `<input>.keyframes.json`.
+- **`full`**: the original behaviour — one giant `filter_complex` with `trim` + `atrim` + `concat`, full re-encode of every kept frame. Slowest but the safest if a player chokes on the SPS/PPS handoff between `smart`-mode encoded heads and stream-copied bodies.
 
 ---
 
@@ -192,7 +211,7 @@ For a 32-minute recording on Apple Silicon (mlx-whisper + VideoToolbox): expect 
 
 ## Limitations
 
-- **Re-encoding is mandatory.** Cuts at non-keyframe boundaries can't use stream copy. Quality is preserved at sensible bitrates but it's not bit-identical to the source.
+- **Frame-accurate cuts require some re-encoding.** Cuts at non-keyframe boundaries can't use pure stream copy. `smart` mode (default) re-encodes only the sub-GOP fragments and stream-copies the rest; `full` re-encodes everything via `filter_complex`. Quality at sensible bitrates is preserved but the output is not bit-identical to the source.
 - **Filler word detection is imperfect.** Whisper drops some "ehm"s no matter how you prompt it. Silence cuts catch most of them anyway because hesitations are usually flanked by pauses.
 - **Default bitrate is 12 Mbps for the VideoToolbox encoder.** If your source is a high-bitrate ProRes or H.265 master, edit the `assemble()` function or use `--encoder libx264` with CRF.
 - **Stereo is preserved but spatial information may drift slightly** at cut boundaries because audio is re-encoded as AAC.

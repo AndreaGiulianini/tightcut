@@ -1,13 +1,16 @@
-# transcription cache & transient ffmpeg filter scripts
+# transcription + keyframe caches & transient ffmpeg filter scripts
 *.whisper.json
+*.keyframes.json
 *.filter.txt
+*.afilter.txt
+*.concat.txt
 
 # typical output files
 *.cut.mov
 *.cut.mp4
 
 # user-supplied source video (don't commit large media)
-Timeline 1.mov
+*.mov
 
 # python
 __pycache__/
